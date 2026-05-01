@@ -1,0 +1,349 @@
+"""
+visualize.py
+------------
+Generates an interactive HTML map (Leaflet.js) showing:
+  • All delivery stop markers
+  • The optimised route polyline
+  • Popup info for each stop (name, coordinates, order)
+  • A route summary panel
+
+The output is a single self-contained HTML file with no external build step.
+"""
+
+import json
+import os
+from typing import List, Dict, Tuple
+
+
+# ---------------------------------------------------------------------------
+# HTML template
+# ---------------------------------------------------------------------------
+
+_HTML_TEMPLATE = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Delivery Route Optimizer — Map</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet-routing-machine@latest/dist/leaflet-routing-machine.css"/>
+<style>
+  /* ── Reset & base ────────────────────────────────────────────── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:        #0a0c10;
+    --surface:   #111418;
+    --surface2:  #181c22;
+    --border:    #2a3040;
+    --accent:    #00e5a0;
+    --accent2:   #0090ff;
+    --accent3:   #ff6b35;
+    --text:      #e8edf5;
+    --text2:     #8899b0;
+    --text3:     #5a6a80;
+    --depot:     #ffd700;
+    --font-mono: 'JetBrains Mono', 'Fira Mono', monospace;
+    --font-ui:   'Syne', 'Segoe UI', sans-serif;
+  }
+
+  html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(--text); font-family: var(--font-ui); }
+
+  /* ── Layout ─────────────────────────────────────────────────── */
+  .app { display: grid; grid-template-rows: 48px 1fr; height: 100vh; }
+
+  /* ── Topbar ──────────────────────────────────────────────────── */
+  .topbar {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; padding: 0 20px; gap: 14px;
+    z-index: 1000; position: relative;
+  }
+  .logo { font-size: 16px; font-weight: 700; letter-spacing: .5px; color: var(--accent); }
+  .logo span { color: var(--text2); font-weight: 400; font-size: 12px; margin-left: 8px; }
+  .badge {
+    font-size: 10px; padding: 3px 10px; border-radius: 20px;
+    font-family: var(--font-mono); letter-spacing: .5px;
+  }
+  .badge-algo  { background: #003a20; color: var(--accent);  border: 1px solid #005530; }
+  .badge-greedy{ background: #001a40; color: var(--accent2); border: 1px solid #002860; }
+  .topbar-right { margin-left: auto; display: flex; gap: 10px; align-items: center; font-size: 12px; color: var(--text2); font-family: var(--font-mono); }
+  .stat-pill {
+    background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 20px; padding: 4px 12px; font-size: 11px;
+  }
+  .stat-pill strong { color: var(--accent); }
+
+  /* ── Main content ────────────────────────────────────────────── */
+  .main { display: grid; grid-template-columns: 300px 1fr; overflow: hidden; }
+
+  /* ── Sidebar ─────────────────────────────────────────────────── */
+  .sidebar {
+    background: var(--surface); border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  .sidebar-header {
+    padding: 14px 16px; border-bottom: 1px solid var(--border);
+    font-size: 11px; font-weight: 600; letter-spacing: 1.5px;
+    text-transform: uppercase; color: var(--text3); font-family: var(--font-mono);
+  }
+  .route-list { flex: 1; overflow-y: auto; padding: 8px; }
+  .route-list::-webkit-scrollbar { width: 4px; }
+  .route-list::-webkit-scrollbar-track { background: transparent; }
+  .route-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+  .step-card {
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; margin-bottom: 6px;
+    cursor: pointer; transition: all .15s;
+    display: flex; align-items: flex-start; gap: 10px;
+  }
+  .step-card:hover { background: var(--surface2); border-color: var(--border); }
+  .step-card.depot { border-color: #554400; background: #1a1400; }
+  .step-num {
+    width: 24px; height: 24px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 10px; font-weight: 700; flex-shrink: 0; font-family: var(--font-mono);
+    background: var(--surface2); border: 1px solid var(--border); color: var(--text2);
+  }
+  .step-num.depot { background: #332200; border-color: #664400; color: var(--depot); }
+  .step-info { flex: 1; min-width: 0; }
+  .step-name { font-size: 13px; font-weight: 600; margin-bottom: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .step-detail { font-size: 10px; color: var(--text3); font-family: var(--font-mono); }
+  .step-dist { font-size: 11px; color: var(--accent); font-family: var(--font-mono); font-weight: 600; }
+
+  .summary-box {
+    padding: 14px; border-top: 1px solid var(--border);
+    display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+  }
+  .sum-card {
+    background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px; text-align: center;
+  }
+  .sum-val { font-size: 22px; font-weight: 700; font-family: var(--font-mono); color: var(--accent); margin-bottom: 2px; }
+  .sum-lbl { font-size: 9px; color: var(--text3); letter-spacing: 1px; text-transform: uppercase; }
+
+  /* ── Map ─────────────────────────────────────────────────────── */
+  #map { height: 100%; }
+  .leaflet-container { background: #0d1117 !important; }
+
+  /* custom popup */
+  .leaflet-popup-content-wrapper {
+    background: var(--surface) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 10px !important;
+    box-shadow: 0 8px 32px rgba(0,0,0,.6) !important;
+    color: var(--text) !important;
+  }
+  .leaflet-popup-tip { background: var(--surface) !important; }
+  .popup-title { font-size: 14px; font-weight: 700; margin-bottom: 6px; color: var(--accent); }
+  .popup-row { font-size: 11px; color: var(--text2); margin-bottom: 3px; font-family: var(--font-mono); }
+  .popup-row span { color: var(--text); }
+  .popup-order { font-size: 11px; color: var(--accent); font-family: var(--font-mono); margin-top: 6px; font-weight: 700; }
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- Topbar -->
+  <div class="topbar">
+    <div class="logo">RouteOpt <span>Delivery Route Optimizer</span></div>
+    <span class="badge badge-algo">Dijkstra's Algorithm</span>
+    <span class="badge badge-greedy">Greedy NN Heuristic</span>
+    <div class="topbar-right">
+      <div class="stat-pill">Stops <strong id="topStops">0</strong></div>
+      <div class="stat-pill">Distance <strong id="topDist">0</strong> km</div>
+    </div>
+  </div>
+
+  <!-- Main -->
+  <div class="main">
+    <!-- Sidebar -->
+    <div class="sidebar">
+      <div class="sidebar-header">Optimised Route</div>
+      <div class="route-list" id="routeList"></div>
+      <div class="summary-box">
+        <div class="sum-card">
+          <div class="sum-val" id="sumStops">0</div>
+          <div class="sum-lbl">Stops</div>
+        </div>
+        <div class="sum-card">
+          <div class="sum-val" id="sumDist">0</div>
+          <div class="sum-lbl">Total km</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Map -->
+    <div id="map"></div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet-routing-machine@latest/dist/leaflet-routing-machine.js"></script>
+<script>
+const DATA = {data_json};
+
+// ── Map setup ────────────────────────────────────────────────────
+const map = L.map('map', { zoomControl: true, attributionControl: false });
+
+L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+  maxZoom: 19,
+  subdomains: 'abcd',
+}).addTo(map);
+
+// ── Helpers ──────────────────────────────────────────────────────
+function svgIcon(color, label, size) {
+  const s = size || 32;
+  const svg = `
+    <svg xmlns="http://www.w3.org/2000/svg" width="${s}" height="${s}" viewBox="0 0 32 32">
+      <circle cx="16" cy="16" r="13" fill="${color}22" stroke="${color}" stroke-width="2"/>
+      <circle cx="16" cy="16" r="6" fill="${color}"/>
+      <text x="16" y="48" text-anchor="middle" font-family="Syne,sans-serif"
+            font-size="9" font-weight="700" fill="${color}">${label}</text>
+    </svg>`;
+  return L.divIcon({
+    html: svg, className: '', iconSize: [s, s + 14], iconAnchor: [s/2, s/2], popupAnchor: [0, -s/2]
+  });
+}
+
+// ── Render route ─────────────────────────────────────────────────
+const route    = DATA.route;     // [{id,name,lat,lon,order}, ...]
+const legs     = DATA.legs;      // [{from,to,dist}, ...]
+const total_km = DATA.total_km;
+const stops    = route.length - 1;  // exclude return to depot
+
+document.getElementById('topStops').textContent = stops;
+document.getElementById('topDist').textContent  = total_km.toFixed(2);
+document.getElementById('sumStops').textContent = stops;
+document.getElementById('sumDist').textContent  = total_km.toFixed(2);
+
+// Setup waypoints for Leaflet Routing Machine
+const waypoints = route.map(n => L.latLng(n.lat, n.lon));
+
+// Markers
+const markers = [];
+
+L.Routing.control({
+  waypoints: waypoints,
+  router: L.Routing.osrmv1({
+    serviceUrl: 'https://router.project-osrm.org/route/v1',
+    profile: 'driving'
+  }),
+  lineOptions: {
+    styles: [{ color: '#00e5a0', opacity: 0.85, weight: 5 }]
+  },
+  createMarker: function(i, wp, nWps) {
+    if (i === route.length - 1 && route[i].lat === route[0].lat && route[i].lon === route[0].lon) {
+      // Don't draw duplicate depot marker at the end
+      return null;
+    }
+    const node = route[i];
+    const isDepot = i === 0;
+    const color   = isDepot ? '#ffd700' : '#00e5a0';
+    const label   = isDepot ? 'D' : String(i);
+    const legDist = legs[i] ? legs[i].dist.toFixed(2) : '—';
+    
+    const marker = L.marker(wp.latLng, { icon: svgIcon(color, label), draggable: false });
+    marker.bindPopup(`
+      <div class="popup-title">${node.name}</div>
+      <div class="popup-row">Lat: <span>${node.lat.toFixed(5)}</span></div>
+      <div class="popup-row">Lon: <span>${node.lon.toFixed(5)}</span></div>
+      ${isDepot ? '' : `<div class="popup-row">Dist from prev: <span>${legDist} km</span></div>`}
+      <div class="popup-order">${isDepot ? '🏭 Depot' : `Stop #${i} of ${stops}`}</div>
+    `);
+    marker.addTo(map);
+    markers.push({ marker, node, idx: i });
+    return marker;
+  },
+  show: false,
+  addWaypoints: false,
+  draggableWaypoints: false,
+  fitSelectedRoutes: true,
+  routeWhileDragging: false
+}).addTo(map);
+
+// ── Sidebar route list ───────────────────────────────────────────
+const listEl = document.getElementById('routeList');
+route.forEach((node, idx) => {
+  if (idx === route.length - 1) return;
+  const isDepot = idx === 0;
+  const leg = legs[idx];
+  const distStr = leg ? leg.dist.toFixed(2) + ' km' : '—';
+  const card = document.createElement('div');
+  card.className = 'step-card' + (isDepot ? ' depot' : '');
+  card.innerHTML = `
+    <div class="step-num ${isDepot ? 'depot' : ''}">${isDepot ? 'D' : idx}</div>
+    <div class="step-info">
+      <div class="step-name">${node.name}</div>
+      <div class="step-detail">${node.lat.toFixed(4)}, ${node.lon.toFixed(4)}</div>
+    </div>
+    ${isDepot ? '' : `<div class="step-dist">${distStr}</div>`}`;
+  card.addEventListener('click', () => {
+    map.setView([node.lat, node.lon], 15, { animate: true });
+    markers.find(m => m.idx === idx)?.marker.openPopup();
+  });
+  listEl.appendChild(card);
+});
+</script>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
+# Visualizer class
+# ---------------------------------------------------------------------------
+
+class RouteVisualizer:
+    """
+    Generates an interactive Leaflet.js map HTML file from route data.
+    """
+
+    def __init__(self, output_path: str = "maps/optimized_route_map.html"):
+        self.output_path = output_path
+
+    def generate(
+        self,
+        graph,           # DeliveryGraph
+        route_result: Dict,
+        open_browser: bool = False,
+    ) -> str:
+        """
+        Build the HTML map and write it to *output_path*.
+
+        Returns the absolute path of the written file.
+        """
+        # Build JSON payload for the template
+        route_nodes = []
+        for nid in route_result["route"]:
+            n = graph.nodes[nid]
+            route_nodes.append({
+                "id":   nid,
+                "name": n["name"],
+                "lat":  n["lat"],
+                "lon":  n["lon"],
+            })
+
+        legs_json = [
+            {"from": frm, "to": to, "dist": dist}
+            for frm, to, dist in route_result["legs"]
+        ]
+
+        payload = {
+            "route":    route_nodes,
+            "legs":     legs_json,
+            "total_km": route_result["total_dist_km"],
+        }
+
+        html = _HTML_TEMPLATE.replace("{data_json}", json.dumps(payload))
+
+        os.makedirs(os.path.dirname(self.output_path) or ".", exist_ok=True)
+        with open(self.output_path, "w", encoding="utf-8") as f:
+            f.write(html)
+
+        if open_browser:
+            import webbrowser
+            webbrowser.open("file://" + os.path.abspath(self.output_path))
+
+        return os.path.abspath(self.output_path)

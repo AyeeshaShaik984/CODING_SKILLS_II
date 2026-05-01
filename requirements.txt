@@ -1,0 +1,9 @@
+# Delivery Route Optimizer — Python dependencies
+# All standard-library except the optional packages below.
+# The core algorithms (Dijkstra, Greedy NN) use only stdlib.
+
+# Optional — only needed if you want to run the test suite
+pytest>=7.0
+
+# Optional — only needed if you want coloured terminal output
+colorama>=0.4.6
